@@ -75,7 +75,7 @@ public class UsaSpendingConnector {
                 .source(SOURCE)
                 .externalId(externalId)
                 .agency((String) row.get("Awarding Agency"))
-                .recipient((String) row.get("recipient Name"))
+                .recipient((String) row.get("Recipient Name"))
                 .amount(toBigDecimal(row.get("Award Amount")))
                 .actionDate(toLocalDate(row.get("Start Date")))
                 .raw(new org.bson.Document(row))
