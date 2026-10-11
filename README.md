@@ -98,6 +98,35 @@ CloudFront + S3 keep serving the site for free. An AWS Budget alerts at $5.
   no fraud labels to train on, and every flag is defensible _(Phase 3)_.
 - **Raw payload preserved** so records can be reprocessed when mappings improve.
 
+**Ingestion (Phase 2)**
+
+### ADR-02 — Asynchronous ingestion (SQS + worker + DLQ), not synchronous fetch-and-write
+**Decision:** A scheduler enqueues one **page-job** message `{source, page, limit}` per
+page to an **SQS** queue; a **worker** long-polls the queue, fetches that page,
+normalizes it, and upserts into MongoDB. Messages that fail 5 times are parked in a
+**dead-letter queue**.
+**Why:**
+- **Isolation** — one failing page (or source) doesn't block the batch; only that
+  message retries.
+- **Backpressure** — the worker consumes at its own pace, so a slow or bursty source
+  never stalls the read API.
+- **No lost work** — at-least-once delivery + DLQ means a bad message is retried and,
+  if still bad, kept for inspection rather than dropped.
+- **Decoupling** — scheduler and worker scale and fail independently.
+
+**Exactly-once effect:** SQS delivers at-least-once (messages can be redelivered), so
+correctness relies on the **idempotent upsert** on `(source, externalId)` (ADR-03) —
+reprocessing a job converges to the same state and never duplicates.
+
+**Rejected:** a synchronous fetch-and-write loop — one source's failure blocks the whole
+batch, there is no isolation or backpressure, and a retry re-runs the entire job.
+
+**Verified in practice:** killing the worker mid-batch and restarting it let the
+in-flight messages reappear after the visibility timeout; they were reprocessed and the
+document count converged — **no loss, no duplicates**. (Gotcha observed: a local worker
+and the deployed worker polling the *same* queue compete for messages — use a separate
+queue per environment.)
+
 **Deploy (this phase)**
 
 ### ADR-07 — Compute: ECS on EC2 (revises ADR-05: Fargate)
