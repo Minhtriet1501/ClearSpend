@@ -1,7 +1,6 @@
 package com.clearspend.ingest;
 
 import com.clearspend.transaction.Transaction;
-import com.clearspend.transaction.TransactionRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.MediaType;
@@ -18,33 +17,29 @@ import java.util.Map;
 @Slf4j
 @Service
 @RequiredArgsConstructor
-public class UsaSpendingConnector {
+public class UsaSpendingConnector implements SourceConnector{
+
 
     private static final String SOURCE = "USAspending";
     private static final List<String> FIELDS = List.of(
             "Award ID", "Recipient Name", "Awarding Agency", "Award Amount", "Start Date");
+    private final TransactionUpserter upserter;
 
     private final RestClient usaSpendingClient;
-    private final TransactionRepository repo;
 
-    public int ingest(int maxPages, int limit) {
-        int processed = 0;
-        for(int page = 1; page <= maxPages; page++){
-            SpendingByAwardResponse resp = fetchPage(page, limit);
-            if(resp == null || resp.results() == null || resp.results().isEmpty()){
-                break;
-            }
-            for(Map<String, Object> row : resp.results()){
-                upsert(row);
-                processed++;
-            }
-            log.info("USAspending page {} -> {} record (tong {})", page, resp.results().size(), processed);
 
-            if(resp.page_metadata() == null || !resp.page_metadata().hasNext()){
-                break;
-            }
+    @Override public String source() { return SOURCE; }
+
+    @Override
+    public int ingestPage(int page, int limit) {
+        SpendingByAwardResponse resp = fetchPage(page, limit);
+        if (resp == null || resp.results() == null) return 0;
+        int n = 0;
+        for(java.util.Map<String, Object> row : resp.results()) {
+            upsert(row);
+            n++;
         }
-        return processed;
+        return n;
     }
 
     private SpendingByAwardResponse fetchPage(int page, int limit){
@@ -82,9 +77,7 @@ public class UsaSpendingConnector {
                 .ingestedAt(Instant.now())
                 .build();
 
-        repo.findBySourceAndExternalId(SOURCE, externalId).ifPresent(existing -> tx.setId(existing.getId()));
-
-        repo.save(tx);
+        upserter.upsert(tx);
     }
 
     private BigDecimal toBigDecimal(Object v){
