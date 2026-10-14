@@ -117,6 +117,4 @@ public class AnomalyService {
                 .ifPresent(existing -> flag.setId(existing.getId()));
         flagRepo.save(flag);
     }
-
-
 }

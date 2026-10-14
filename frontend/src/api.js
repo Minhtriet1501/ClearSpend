@@ -4,4 +4,10 @@ export async function fetchTransactions({ page = 0, size = 20, sort = 'amount,de
     const res = await fetch(`${API_BASE}/transactions?page=${page}&size=${size}&sort=${sort}`)
     if (!res.ok) throw new Error('HTTP ' + res.status)
     return res.json()
+
+    export async function fetchFlags() {
+        const res = await fetch(`${API_BASE}/flags`)
+        if (!res.ok) throw new Error('HTTP ' + res.status)
+        return res.json()
+    }
 }
