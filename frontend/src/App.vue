@@ -1,14 +1,15 @@
 <script setup>
 import { ref, onMounted } from 'vue'
-import { fetchTransactions, fetchFlags } from './api.js'
+import { searchTransactions, fetchFlags } from './api.js'
 
 const tab = ref('transactions')
 
-// --- transactions ---
+// --- transactions / search ---
 const SIZE = 20
 const rows = ref([])
 const info = ref({ number: 0, totalPages: 0, totalElements: 0, first: true, last: true })
 const page = ref(0)
+const q = ref({ agency: '', recipient: '', minAmount: '' })
 const loading = ref(false)
 const error = ref('')
 const money = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 })
@@ -16,10 +17,12 @@ const money = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD
 async function load() {
   loading.value = true; error.value = ''
   try {
-    const data = await fetchTransactions({ page: page.value, size: SIZE })
+    const data = await searchTransactions({ ...q.value, page: page.value, size: SIZE })
     rows.value = data.content; info.value = data
   } catch (e) { error.value = e.message } finally { loading.value = false }
 }
+function doSearch() { page.value = 0; load() }
+function clearSearch() { q.value = { agency: '', recipient: '', minAmount: '' }; page.value = 0; load() }
 function prev() { if (!info.value.first) { page.value--; load() } }
 function next() { if (!info.value.last) { page.value++; load() } }
 
@@ -54,6 +57,13 @@ onMounted(load)
 
     <!-- TRANSACTIONS -->
     <section v-if="tab === 'transactions'">
+      <div class="search">
+        <input v-model="q.agency" placeholder="Agency" @keyup.enter="doSearch" />
+        <input v-model="q.recipient" placeholder="Recipient" @keyup.enter="doSearch" />
+        <input v-model="q.minAmount" type="number" placeholder="Min $" @keyup.enter="doSearch" />
+        <button @click="doSearch">Search</button>
+        <button class="ghost" @click="clearSearch">Clear</button>
+      </div>
       <div class="bar">
         <button :disabled="info.first || loading" @click="prev">← Prev</button>
         <button :disabled="info.last || loading" @click="next">Next →</button>
@@ -66,12 +76,13 @@ onMounted(load)
       <table v-else>
         <thead><tr><th>Agency</th><th>Recipient</th><th class="right">Amount</th><th>Action date</th></tr></thead>
         <tbody>
-        <tr v-for="t in rows" :key="t.id">
-          <td>{{ t.agency ?? '—' }}</td>
-          <td>{{ t.recipient ?? '—' }}</td>
-          <td class="right amount">{{ t.amount != null ? money.format(t.amount) : '—' }}</td>
-          <td>{{ t.actionDate ?? '—' }}</td>
-        </tr>
+          <tr v-for="t in rows" :key="t.id">
+            <td>{{ t.agency ?? '—' }}</td>
+            <td>{{ t.recipient ?? '—' }}</td>
+            <td class="right amount">{{ t.amount != null ? money.format(t.amount) : '—' }}</td>
+            <td>{{ t.actionDate ?? '—' }}</td>
+          </tr>
+          <tr v-if="rows.length === 0 && !loading"><td colspan="4" class="muted">Không có kết quả.</td></tr>
         </tbody>
       </table>
     </section>
@@ -101,6 +112,11 @@ main { max-width: 1000px; margin: 24px auto; padding: 0 16px; }
 .tabs { display: flex; gap: 8px; margin-bottom: 16px; border-bottom: 1px solid #ddd; }
 .tabs button { border: none; background: none; padding: 8px 14px; cursor: pointer; font-size: 14px; color: #666; border-bottom: 2px solid transparent; }
 .tabs button.active { color: #0b5a4e; border-bottom-color: #0b5a4e; font-weight: 600; }
+
+.search { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+.search input { padding: 6px 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; }
+.search button { padding: 6px 12px; border: 1px solid #0b5a4e; background: #0b5a4e; color: #fff; border-radius: 6px; cursor: pointer; }
+.search button.ghost { background: #fff; color: #0b5a4e; }
 
 .bar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
 .bar button { padding: 6px 12px; border: 1px solid #ccc; background: #fff; border-radius: 6px; cursor: pointer; }
