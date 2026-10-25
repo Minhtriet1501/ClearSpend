@@ -36,6 +36,14 @@ public class TransactionController {
             @RequestParam(required = false) BigDecimal minAmount,
             Pageable pageable) {
 
+        Query query = buildSearchQuery(agency, recipient, minAmount);
+        long total = mongo.count(query, Transaction.class);
+        var content = mongo.find(query.with(pageable), Transaction.class);
+        return new PageImpl<>(content, pageable, total);
+    }
+
+
+    static Query buildSearchQuery(String agency, String recipient, BigDecimal minAmount) {
         var criteria = new ArrayList<Criteria>();
         if (agency != null && !agency.isBlank())
             criteria.add(Criteria.where("agency").regex(Pattern.quote(agency), "i"));
@@ -47,9 +55,6 @@ public class TransactionController {
         Query query = new Query();
         if (!criteria.isEmpty())
             query.addCriteria(new Criteria().andOperator(criteria.toArray(new Criteria[0])));
-
-        long total = mongo.count(query, Transaction.class);
-        var content = mongo.find(query.with(pageable), Transaction.class);
-        return new PageImpl<>(content, pageable, total);
+        return query;
     }
 }

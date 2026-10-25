@@ -44,19 +44,19 @@ public class AnomalyService {
             if(agency == null || row.get("median") == null) continue;
             BigDecimal median = new  BigDecimal(row.get("median").toString());
             if(median.signum() <= 0 ) continue;
-            BigDecimal threshold = median.multiply(BigDecimal.valueOf(k));
+            BigDecimal threshold = AnomalyRules.spikeThreshold(median, k);
 
             List<Transaction> spikes = mongo.find(
                     new Query(Criteria.where("agency").is(agency).and("amount").gt(threshold)),
                     Transaction.class);
 
             for(Transaction t : spikes) {
-                double ratio = t.getAmount().divide(median, 1, RoundingMode.HALF_UP).doubleValue();
+                double ratio = AnomalyRules.spikeRatio(t.getAmount(), median);
                 String explanation = String.format(
                         "%s paid $%,.0f to %s — %.1f× the %s median of $%,.0f.",
                         agency, t.getAmount(), t.getRecipient(), ratio, agency, median);
 
-                upsertFlag(t.getId(), "SPIKE_VS_MEDIAN", ratio >= 20 ? "HIGH" : "MEDIUM", explanation);
+                upsertFlag(t.getId(), "SPIKE_VS_MEDIAN", AnomalyRules.spikeSeverity(ratio), explanation);
 
                 flagged++;
             }
@@ -90,7 +90,7 @@ public class AnomalyService {
                 if(recipient == null || v.get("spent") == null) continue;
                 BigDecimal spent = new BigDecimal(v.get("spent").toString());
                 double share = spent.divide(total, 4, RoundingMode.HALF_UP).doubleValue();
-                if(share < vendorShare) continue;
+                if(!AnomalyRules.isConcentrated(share, vendorShare)) continue;
 
                 Transaction rep = mongo.findOne(
                         new Query(Criteria.where("agency").is(agency).and("recipient").is(recipient))
@@ -101,7 +101,7 @@ public class AnomalyService {
                 String explanation = String.format(
                         "%s received %.0f%% of %s's spend ($%,.0f of $%,.0f).",
                         recipient, share * 100, agency, spent, total);
-                upsertFlag(rep.getId(), "VENDOR_CONCENTRATION", share >= 0.8 ? "HIGH" : "MEDIUM", explanation);
+                upsertFlag(rep.getId(), "VENDOR_CONCENTRATION", AnomalyRules.concentrationSeverity(share), explanation);
                 flagged++;
             }
         }
