@@ -1,3 +1,15 @@
-:root { font-family: system-ui, sans-serif; }
+:root {
+  --paper: #ffffff;
+  --bg: #f0efec;
+  --ink: #1a1a1a;
+  --ink-2: #5c5c5c;
+  --ink-3: #9a9a9a;
+  --line: #e2e1dd;
+  --radius: 6px;
+  --s1: 8px; --s2: 16px; --s3: 24px; --s4: 32px;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color-scheme: light;
+}
 * { box-sizing: border-box; }
-body { margin: 0; background: #f6f8fa; color: #1a1a1a; }
+body { margin: 0; background: var(--bg); color: var(--ink); font-family: var(--sans); font-size: 14px; line-height: 1.55; -webkit-font-smoothing: antialiased; }
