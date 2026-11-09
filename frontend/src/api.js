@@ -6,10 +6,6 @@ async function getJson(path) {
     return res.json()
 }
 
-export function fetchTransactions({ page = 0, size = 20, sort = 'amount,desc' } = {}) {
-    return getJson(`/transactions?page=${page}&size=${size}&sort=${sort}`)
-}
-
 export function fetchFlags() {
     return getJson('/flags')
 }
@@ -18,8 +14,16 @@ export function fetchStats() {
     return getJson('/stats')
 }
 
-export function fetchAgencies() {
-    return getJson('/transactions/agencies')
+export function fetchAgencies(source) {
+    return getJson(`/transactions/agencies${source ? '?source=' + encodeURIComponent(source) : ''}`)
+}
+
+export function fetchOverview(source) {
+    return getJson(`/stats/overview${source ? '?source=' + encodeURIComponent(source) : ''}`)
+}
+
+export function fetchAgencyStats(name) {
+    return getJson(`/stats/agency?name=${encodeURIComponent(name)}`)
 }
 
 export function searchTransactions({

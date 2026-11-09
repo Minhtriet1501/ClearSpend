@@ -1,6 +1,13 @@
 <script setup>
-import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
-import { searchTransactions, fetchFlags, fetchStats, fetchAgencies } from './api.js'
+import { ref, reactive, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
+import { Chart, registerables } from 'chart.js'
+import { searchTransactions, fetchFlags, fetchStats, fetchAgencies, fetchOverview, fetchAgencyStats } from './api.js'
+
+Chart.register(...registerables)
+Chart.defaults.font.family = "'IBM Plex Mono', monospace"
+Chart.defaults.font.size = 11
+Chart.defaults.color = '#5c5c5c'
+const INK = '#1a1a1a', INK3 = '#c7c7c3', RED = '#c0261d', LINE = '#e2e1dd'
 
 const SIZE = 20
 const view = ref('tx')
@@ -16,23 +23,36 @@ const error = ref('')
 const q = reactive({ agency: '', recipient: '', minAmount: '', maxAmount: '', source: '', dateFrom: '', dateTo: '', sort: 'amount,desc' })
 const severity = ref('')
 const activeChip = ref('all')
-const agencies = ref([])
+const txAgencies = ref([])
 
-// flags
+// flags (for status column + detail cross-reference)
 const flags = ref([])
-const flagsLoading = ref(false)
-const flagsError = ref('')
 const flagsByTx = ref({})
 const flagsFull = ref({})
 
 // stats + detail
+const statsSource = ref('')
+const statsAgency = ref('')
+const statsAgencies = ref([])
+const overview = ref(null)
+const agencyStats = ref(null)
+let statsInit = false
+
 const stats = ref(null)
 const selected = ref(null)
 
 const money = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 })
 const nfmt = v => (v ?? 0).toLocaleString('en-US')
 const fmtDate = s => s ? new Date(s).toISOString().slice(0, 10) : ''
-const sourceLabel = s => s === 'USAspending' ? 'USAspending.gov' : s === 'MesaAZ' ? 'City of Mesa, AZ' : (s || '')
+const sourceLabel = s => s === 'USAspending' ? 'US Federal' : s === 'MesaAZ' ? 'City of Mesa, AZ' : (s || '')
+const compact = v => {
+  const a = Math.abs(v)
+  if (a >= 1e12) return '$' + (v / 1e12).toFixed(2) + 'T'
+  if (a >= 1e9) return '$' + (v / 1e9).toFixed(1) + 'B'
+  if (a >= 1e6) return '$' + (v / 1e6).toFixed(1) + 'M'
+  if (a >= 1e3) return '$' + (v / 1e3).toFixed(0) + 'K'
+  return '$' + v
+}
 
 function agencyIcon(name) {
   const n = (name || '').toLowerCase()
@@ -44,10 +64,11 @@ function agencyIcon(name) {
   if (n.includes('veteran')) return '#ic-veterans'
   if (n.includes('justice')) return '#ic-justice'
   if (n.includes('treasury') || n.includes('financ')) return '#ic-finance'
-  if (n.includes('city of') || n.includes('mesa') || n.includes('county') || n.includes('town')) return '#ic-city'
+  if (n.includes('city of') || n.includes('mesa') || n.includes('county') || n.includes('town') || n.includes('public') || n.includes('parks') || n.includes('water')) return '#ic-city'
   return '#ic-doc'
 }
 
+// ---- transactions ----
 async function load() {
   loading.value = true; error.value = ''
   try {
@@ -55,23 +76,20 @@ async function load() {
     rows.value = d.content; info.value = d
   } catch (e) { error.value = e.message } finally { loading.value = false }
 }
-
 async function loadFlags() {
-  flagsLoading.value = true; flagsError.value = ''
   try {
-    const f = await fetchFlags()
-    flags.value = f
+    const f = await fetchFlags(); flags.value = f
     const sev = {}, full = {}
     for (const x of f) {
       (full[x.transactionId] ||= []).push(x)
       sev[x.transactionId] = (sev[x.transactionId] === 'HIGH' || x.severity === 'HIGH') ? 'HIGH' : x.severity
     }
     flagsByTx.value = sev; flagsFull.value = full
-  } catch (e) { flagsError.value = e.message } finally { flagsLoading.value = false }
+  } catch (e) { /* ignore */ }
 }
-
 async function loadStats() { try { stats.value = await fetchStats() } catch (e) { stats.value = null } }
-async function loadAgencies() { try { agencies.value = await fetchAgencies() } catch (e) { agencies.value = [] } }
+async function loadTxAgencies() { try { txAgencies.value = await fetchAgencies(q.source) } catch (e) { txAgencies.value = [] } }
+async function onTxSourceChange() { q.agency = ''; await loadTxAgencies(); doSearch() }
 
 function sevOf(t) { return flagsByTx.value[t.id] || null }
 const selectedFlags = computed(() => selected.value ? (flagsFull.value[selected.value.id] || []) : [])
@@ -93,10 +111,9 @@ function chip(key) {
   else if (key === 'year') { severity.value = ''; const y = new Date().getFullYear(); q.dateFrom = `${y}-01-01`; q.dateTo = `${y}-12-31` }
   doSearch()
 }
-
 function resetFilters() {
   q.agency = ''; q.recipient = ''; q.minAmount = ''; q.maxAmount = ''; q.source = ''; q.dateFrom = ''; q.dateTo = ''; q.sort = 'amount,desc'
-  severity.value = ''; activeChip.value = 'all'; page.value = 0; load()
+  severity.value = ''; activeChip.value = 'all'; page.value = 0; loadTxAgencies(); load()
 }
 
 const sTransactions = computed(() => stats.value?.transactions ?? info.value.totalElements)
@@ -104,9 +121,76 @@ const sTotalValue = computed(() => stats.value ? money.format(stats.value.totalV
 const sFlagged = computed(() => stats.value?.flags ?? flags.value.length)
 const sHigh = computed(() => stats.value?.flagsHigh ?? flags.value.filter(f => f.severity === 'HIGH').length)
 
+// ---- statistics (Chart.js) ----
+let charts = {}
+function killCharts() { Object.values(charts).forEach(c => c && c.destroy()); charts = {} }
+function hbar(id, labels, data, hiIdx) {
+  const el = document.getElementById(id); if (!el) return
+  const colors = data.map((_, i) => i === hiIdx ? RED : INK)
+  charts[id] = new Chart(el, {
+    type: 'bar',
+    data: { labels, datasets: [{ data, backgroundColor: colors, borderRadius: 4, barThickness: 15 }] },
+    options: {
+      indexAxis: 'y', responsive: true, maintainAspectRatio: false, animation: { duration: 650 },
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => compact(c.raw) } } },
+      scales: { x: { grid: { color: LINE }, border: { display: false }, ticks: { callback: compact } }, y: { grid: { display: false }, border: { display: false } } }
+    }
+  })
+}
+function lineC(id, labels, data) {
+  const el = document.getElementById(id); if (!el) return
+  charts[id] = new Chart(el, {
+    type: 'line',
+    data: { labels, datasets: [{ data, borderColor: INK, backgroundColor: 'rgba(26,26,26,.07)', fill: true, tension: .35, pointRadius: 3, pointBackgroundColor: INK, borderWidth: 2 }] },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: { duration: 700 },
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: c => compact(c.raw) } } },
+      scales: { x: { grid: { display: false }, border: { display: false } }, y: { grid: { color: LINE }, border: { display: false }, ticks: { callback: compact } } }
+    }
+  })
+}
+function dough(id, data) {
+  const el = document.getElementById(id); if (!el) return
+  charts[id] = new Chart(el, {
+    type: 'doughnut',
+    data: { labels: ['High', 'Medium'], datasets: [{ data, backgroundColor: [RED, INK3], borderWidth: 2, borderColor: '#fff' }] },
+    options: { responsive: true, maintainAspectRatio: false, cutout: '62%', animation: { duration: 650 }, plugins: { legend: { position: 'right', labels: { boxWidth: 10, font: { size: 12 } } } } }
+  })
+}
+function renderOverviewCharts() {
+  killCharts(); const o = overview.value; if (!o) return
+  hbar('c-agencies', o.topAgencies.map(a => a.agency), o.topAgencies.map(a => a.total))
+  lineC('c-year', o.byYear.map(y => String(y.year)), o.byYear.map(y => y.total))
+  dough('c-flags', [o.flags.high, o.flags.medium])
+}
+function renderDeepDiveCharts() {
+  killCharts(); const a = agencyStats.value; if (!a) return
+  const hi = a.topRecipients.length && a.topRecipients[0].share >= 0.5 ? 0 : -1
+  hbar('c-recipients', a.topRecipients.map(r => r.recipient), a.topRecipients.map(r => r.total), hi)
+  lineC('c-ddyear', a.byYear.map(y => String(y.year)), a.byYear.map(y => y.total))
+}
+async function loadStatsAgencies() { try { statsAgencies.value = await fetchAgencies(statsSource.value) } catch (e) { statsAgencies.value = [] } }
+async function openAgency(name) {
+  statsAgency.value = name
+  if (name) {
+    try { agencyStats.value = await fetchAgencyStats(name) } catch (e) { agencyStats.value = null }
+    await nextTick(); renderDeepDiveCharts()
+  } else {
+    try { overview.value = await fetchOverview(statsSource.value) } catch (e) { overview.value = null }
+    await nextTick(); renderOverviewCharts()
+  }
+}
+async function onStatsSourceChange() { await loadStatsAgencies(); await openAgency('') }
+
+watch(view, async (v) => {
+  if (v !== 'stats') return
+  if (!statsInit) { statsInit = true; await loadStatsAgencies(); await openAgency('') }
+  else { await nextTick(); Object.values(charts).forEach(c => c && c.resize()) }
+})
+
 function onKey(e) { if (e.key === 'Escape') selected.value = null }
-onMounted(() => { loadStats(); loadAgencies(); loadFlags(); load(); window.addEventListener('keydown', onKey) })
-onUnmounted(() => window.removeEventListener('keydown', onKey))
+onMounted(() => { loadStats(); loadFlags(); loadTxAgencies(); load(); window.addEventListener('keydown', onKey) })
+onUnmounted(() => { window.removeEventListener('keydown', onKey); killCharts() })
 </script>
 
 <template>
@@ -124,9 +208,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
   </svg>
 
   <div class="shell">
-    <!-- detail (left) -->
     <aside class="detail-col" :class="{ open: !!selected }" aria-label="Transaction detail">
-      <template v-if="selected">
+      <div v-if="selected" :key="selected.id" class="dcontent">
         <div class="dhead">
           <span class="eyebrow">Transaction detail</span>
           <button class="xbtn" @click="selected = null" aria-label="Close detail"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
@@ -138,7 +221,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
         </div>
         <hr class="dash">
         <div class="summary">
-          <div class="trow"><span class="k">Source</span><span class="dots"></span><span class="v">{{ sourceLabel(selected.source) }}</span></div>
+          <div class="trow"><span class="k">Government</span><span class="dots"></span><span class="v">{{ sourceLabel(selected.source) }}</span></div>
           <div class="trow"><span class="k">Action date</span><span class="dots"></span><span class="v">{{ selected.actionDate ?? '' }}</span></div>
           <div class="trow"><span class="k">External ID</span><span class="dots"></span><span class="v dwrap">{{ selected.externalId }}</span></div>
           <div class="trow"><span class="k">Status</span><span class="dots"></span><span class="v">{{ detailStatus }}</span></div>
@@ -150,18 +233,19 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
           <div class="top"><span class="tag" :class="fl.severity === 'HIGH' ? 'high' : 'med'">{{ fl.severity === 'HIGH' ? 'High' : 'Medium' }}</span><span class="rule">{{ fl.rule }}</span></div>
           <p>{{ fl.explanation }}</p>
         </div>
-      </template>
+      </div>
     </aside>
 
-    <!-- main (right) -->
     <div class="main-col">
       <header class="masthead">
-        <svg class="brandmark" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M6 5.5a1 1 0 0 1 1-1h8.5a1 1 0 0 1 1 1V17"/>
-          <path d="M6 5.5V25l2-1.4 2 1.4 2-1.4"/>
-          <path d="M9 9.5h5M9 12.8h5"/>
-          <circle cx="20" cy="19.5" r="5.2" fill="#ffffff"/>
-          <path d="M23.8 23.3 27.5 27"/>
+        <svg class="brandmark" viewBox="0 0 44 44" aria-hidden="true">
+          <rect x="1.5" y="1.5" width="41" height="41" rx="11" fill="#1a1a1a"/>
+          <g fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="13" y="12" width="11.5" height="17.5" rx="1.5"/>
+            <path d="M16 16.5h5.5M16 19.5h5.5M16 22.5h3.5"/>
+            <circle cx="27.5" cy="27.5" r="5" fill="#1a1a1a"/>
+            <path d="M31.1 31.1 34 34"/>
+          </g>
         </svg>
         <div class="wordmark">CLEARSPEND</div>
         <div class="tagline">Public spending, itemized</div>
@@ -169,7 +253,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
 
       <nav class="switch">
         <button class="seg" :aria-pressed="view === 'tx'" @click="view = 'tx'">Transactions</button>
-        <button class="seg" :aria-pressed="view === 'flags'" @click="view = 'flags'">Flags <span class="c">{{ nfmt(sFlagged) }}</span></button>
+        <button class="seg" :aria-pressed="view === 'stats'" @click="view = 'stats'">Statistics <span class="c">{{ nfmt(sFlagged) }}</span></button>
       </nav>
 
       <main class="receipt">
@@ -194,20 +278,20 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
               <button class="chip" :class="{ active: activeChip === 'year' }" @click="chip('year')">This year</button>
             </div>
             <div class="fgrid">
-              <div class="fld"><label>Agency</label>
-                <select class="ipt" v-model="q.agency" @change="doSearch">
-                  <option value="">All agencies</option>
-                  <option v-for="a in agencies" :key="a" :value="a">{{ a }}</option>
-                </select>
-              </div>
-              <div class="fld"><label>Recipient</label><input class="ipt" v-model="q.recipient" @keyup.enter="doSearch" placeholder="All recipients"></div>
-              <div class="fld"><label>Source</label>
-                <select class="ipt" v-model="q.source" @change="doSearch">
-                  <option value="">All sources</option>
-                  <option value="USAspending">USAspending.gov</option>
+              <div class="fld"><label>Government</label>
+                <select class="ipt" v-model="q.source" @change="onTxSourceChange">
+                  <option value="">All governments</option>
+                  <option value="USAspending">US Federal</option>
                   <option value="MesaAZ">City of Mesa, AZ</option>
                 </select>
               </div>
+              <div class="fld"><label>Agency</label>
+                <select class="ipt" v-model="q.agency" @change="doSearch">
+                  <option value="">All agencies</option>
+                  <option v-for="a in txAgencies" :key="a" :value="a">{{ a }}</option>
+                </select>
+              </div>
+              <div class="fld"><label>Recipient</label><input class="ipt" v-model="q.recipient" @keyup.enter="doSearch" placeholder="All recipients"></div>
               <div class="fld"><label>Min amount</label><input class="ipt" v-model="q.minAmount" inputmode="numeric" @keyup.enter="doSearch" placeholder="Any"></div>
               <div class="fld"><label>Max amount</label><input class="ipt" v-model="q.maxAmount" inputmode="numeric" @keyup.enter="doSearch" placeholder="Any"></div>
               <div class="fld"><label>From date</label><input class="ipt" type="date" v-model="q.dateFrom" @change="doSearch"></div>
@@ -257,24 +341,54 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
           </template>
         </section>
 
-        <!-- Flags -->
-        <section v-show="view === 'flags'">
-          <p v-if="flagsLoading" class="state">Loading…</p>
-          <p v-else-if="flagsError" class="state">Could not load flags. ({{ flagsError }})</p>
-          <p v-else-if="flags.length === 0" class="state">No flags yet. Run the anomaly job to populate them.</p>
-          <template v-else>
-            <div class="flags">
-              <div v-for="f in flags" :key="f.id" class="slip" :class="{ high: f.severity === 'HIGH' }">
-                <div class="top">
-                  <span class="tag" :class="f.severity === 'HIGH' ? 'high' : 'med'">{{ f.severity === 'HIGH' ? 'High' : 'Medium' }}</span>
-                  <span class="rule">{{ f.rule }}</span>
+        <!-- Statistics -->
+        <section v-show="view === 'stats'">
+          <div class="stats-scope">
+            <div class="sfld"><label>Government</label>
+              <select class="ipt" v-model="statsSource" @change="onStatsSourceChange">
+                <option value="">All governments</option>
+                <option value="USAspending">US Federal</option>
+                <option value="MesaAZ">City of Mesa, AZ</option>
+              </select>
+            </div>
+            <div class="sfld"><label>Agency</label>
+              <select class="ipt" v-model="statsAgency" @change="openAgency(statsAgency)">
+                <option value="">All agencies</option>
+                <option v-for="a in statsAgencies" :key="a" :value="a">{{ a }}</option>
+              </select>
+            </div>
+          </div>
+
+          <div v-show="!statsAgency">
+            <div class="chart-block"><div class="chart-title">Top agencies by spend</div><div class="chart-box" style="height:220px"><canvas id="c-agencies"></canvas></div></div>
+            <div class="chart-block"><div class="chart-title">Spend by year</div><div class="chart-box" style="height:180px"><canvas id="c-year"></canvas></div></div>
+            <div class="chart-block"><div class="chart-title">Flags by severity</div><div class="chart-box" style="height:200px"><canvas id="c-flags"></canvas></div></div>
+          </div>
+
+          <div v-if="statsAgency && agencyStats">
+            <div class="dd-head"><svg class="aic"><use :href="agencyIcon(agencyStats.agency)"/></svg><span>{{ agencyStats.agency }}</span></div>
+            <hr class="dash soft">
+            <div class="summary">
+              <div class="trow em"><span class="k">Total spent</span><span class="dots"></span><span class="v">{{ money.format(agencyStats.total) }}</span></div>
+              <div class="trow"><span class="k">Transactions</span><span class="dots"></span><span class="v">{{ nfmt(agencyStats.count) }}</span></div>
+              <div class="trow alert"><span class="k">Flags</span><span class="dots"></span><span class="v">{{ agencyStats.flags.length }}</span></div>
+            </div>
+            <hr class="dash soft">
+            <div class="chart-block"><div class="chart-title">Top recipients</div><div class="chart-box" style="height:200px"><canvas id="c-recipients"></canvas></div></div>
+            <div class="chart-block"><div class="chart-title">Spend by year</div><div class="chart-box" style="height:180px"><canvas id="c-ddyear"></canvas></div></div>
+            <hr class="dash soft">
+            <div class="chart-block">
+              <div class="chart-title">Flags</div>
+              <div v-if="agencyStats.flags.length === 0" class="state">No anomalies flagged for this agency.</div>
+              <div v-else class="flags">
+                <div v-for="f in agencyStats.flags" :key="f.id" class="slip" :class="{ high: f.severity === 'HIGH' }">
+                  <div class="top"><span class="tag" :class="f.severity === 'HIGH' ? 'high' : 'med'">{{ f.severity === 'HIGH' ? 'High' : 'Medium' }}</span><span class="rule">{{ f.rule }}</span></div>
+                  <p class="explain">{{ f.explanation }}</p>
+                  <div class="meta"><span>Flagged {{ fmtDate(f.createdAt) }}</span></div>
                 </div>
-                <p class="explain">{{ f.explanation }}</p>
-                <div class="meta"><span>Flagged {{ fmtDate(f.createdAt) }}</span></div>
               </div>
             </div>
-            <div class="subtotal"><span>Shown {{ flags.length }}</span><span class="dots"></span><span>of {{ nfmt(sFlagged) }} flags</span></div>
-          </template>
+          </div>
         </section>
       </main>
 
@@ -290,7 +404,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
 .main-col { grid-column: 2; min-width: 0; }
 
 .masthead { text-align: center; margin-bottom: var(--s3); }
-.brandmark { width: 40px; height: 40px; color: var(--ink); margin-bottom: 10px; }
+.brandmark { display: inline-block; width: 44px; height: 44px; margin-bottom: 10px; }
 .wordmark { font-family: var(--mono); font-weight: 700; font-size: 30px; letter-spacing: .18em; text-indent: .18em; }
 .tagline { font-family: var(--mono); font-weight: 500; font-size: 11px; letter-spacing: .26em; text-indent: .26em; color: var(--ink-3); text-transform: uppercase; margin-top: 6px; }
 
@@ -308,6 +422,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
 .receipt::after { content: ""; position: absolute; left: -1px; right: -1px; bottom: -9px; height: 10px; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='10'%3E%3Cpath d='M0,0H14L7,10Z' fill='%23ffffff'/%3E%3C/svg%3E"); background-repeat: repeat-x; background-size: 14px 10px; }
 .rhead { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-2); }
 .dash { border: 0; border-top: 1.5px dashed var(--ink); margin: var(--s3) 0; opacity: .85; }
+.dash.soft { border-top-color: var(--line); opacity: 1; }
 
 .summary { display: grid; gap: 10px; font-family: var(--mono); font-size: 13px; }
 .trow { display: flex; align-items: baseline; gap: var(--s1); }
@@ -356,10 +471,10 @@ tbody tr.sel { background: var(--press); }
 tbody td { padding: 13px var(--s2) 13px 0; border-bottom: 1px dashed var(--line); vertical-align: baseline; }
 tbody tr:last-child td { border-bottom: 0; }
 .agency { font-weight: 600; display: flex; align-items: center; gap: 7px; }
-.recipient { color: var(--ink-2); font-size: 13px; padding-left: 21px; }
+.recipient { color: var(--ink-2); font-size: 13px; padding-left: 31px; }
 td.amount { font-family: var(--mono); font-weight: 500; font-variant-numeric: tabular-nums; white-space: nowrap; }
 td.date { font-family: var(--mono); font-size: 12px; color: var(--ink-2); white-space: nowrap; }
-.aic { width: 14px; height: 14px; flex: none; color: var(--ink-2); fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.aic { width: 24px; height: 24px; flex: none; color: var(--ink); fill: none; stroke: currentColor; stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round; border: 1px solid var(--line); border-radius: var(--radius); padding: 4px; background: var(--paper); box-sizing: border-box; }
 
 .tag { display: inline-flex; align-items: center; height: 20px; padding: 0 7px; border-radius: var(--radius); font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
 .tag.high { background: var(--ink); color: var(--paper); }
@@ -382,16 +497,24 @@ td.date { font-family: var(--mono); font-size: 12px; color: var(--ink-2); white-
 .slip .top { display: flex; align-items: center; gap: var(--s1); margin-bottom: 10px; flex-wrap: wrap; }
 .slip .rule { font-family: var(--mono); font-size: 12px; letter-spacing: .06em; color: var(--ink-3); }
 .slip .explain { margin: 0; font-size: 14px; }
-.slip .explain b { font-weight: 600; }
 .slip .meta { display: flex; gap: var(--s3); flex-wrap: wrap; margin-top: var(--s2); padding-top: var(--s2); border-top: 1px dashed var(--line); font-family: var(--mono); font-size: 11px; letter-spacing: .04em; color: var(--ink-3); }
+
+.stats-scope { display: flex; gap: var(--s2); margin-bottom: var(--s3); flex-wrap: wrap; }
+.sfld { display: flex; flex-direction: column; gap: 6px; flex: 1 1 180px; min-width: 0; }
+.sfld label { font-family: var(--mono); font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-2); }
+.chart-block { margin-bottom: var(--s3); }
+.chart-title { font-family: var(--mono); font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-2); margin-bottom: var(--s2); }
+.chart-box { position: relative; width: 100%; }
+.dd-head { display: flex; align-items: center; gap: var(--s1); font-family: var(--mono); font-weight: 600; font-size: 15px; }
 
 .state { font-family: var(--mono); font-size: 13px; color: var(--ink-3); text-align: center; padding: var(--s4) 0; }
 .foot { text-align: center; font-family: var(--mono); font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-3); margin-top: var(--s4); }
 
-/* detail: left column on wide screens, drawer on narrow */
 .detail-col { grid-column: 1; justify-self: end; align-self: start; width: min(330px, 100%); min-width: 0; position: sticky; top: var(--s4); background: var(--paper); border: 1px solid var(--line); border-bottom: 0; border-radius: var(--radius) var(--radius) 0 0; padding: var(--s3); display: flex; flex-direction: column; gap: var(--s2); opacity: 0; transform: translateX(-12px); pointer-events: none; transition: opacity .18s ease, transform .2s ease; }
 .detail-col.open { opacity: 1; transform: none; pointer-events: auto; }
 .detail-col::after { content: ""; position: absolute; left: -1px; right: -1px; bottom: -9px; height: 10px; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='10'%3E%3Cpath d='M0,0H14L7,10Z' fill='%23ffffff'/%3E%3C/svg%3E"); background-repeat: repeat-x; background-size: 14px 10px; }
+.dcontent { display: flex; flex-direction: column; gap: var(--s2); animation: paperDrop .22s cubic-bezier(.2, .7, .3, 1); }
+@keyframes paperDrop { 0% { opacity: 0; transform: translateY(-10px) scale(.985); } 60% { opacity: 1; } 100% { opacity: 1; transform: none; } }
 .dhead { display: flex; align-items: center; justify-content: space-between; }
 .eyebrow { font-family: var(--mono); font-size: 11px; letter-spacing: .16em; text-transform: uppercase; color: var(--ink-2); }
 .xbtn { width: 32px; height: 32px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--paper); color: var(--ink); display: grid; place-items: center; cursor: pointer; transition: background .12s, transform .04s; }
@@ -401,7 +524,7 @@ td.date { font-family: var(--mono); font-size: 12px; color: var(--ink-2); white-
 .xbtn svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; }
 .damt { font-family: var(--mono); font-size: 26px; font-weight: 700; font-variant-numeric: tabular-nums; }
 .dparty { display: flex; align-items: flex-start; gap: 9px; }
-.dparty .aic { width: 16px; height: 16px; margin-top: 3px; }
+.dparty .aic { width: 32px; height: 32px; margin-top: 1px; padding: 6px; }
 .dparty .dagency { font-weight: 600; display: block; }
 .dparty .drecipient { color: var(--ink-2); font-size: 13px; display: block; }
 .dsec-label { font-family: var(--mono); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-3); margin-bottom: var(--s1); }
@@ -426,5 +549,5 @@ td.date { font-family: var(--mono); font-size: 12px; color: var(--ink-2); white-
   .receipt { padding: var(--s3) var(--s2); }
   .seg { height: 50px; font-size: 13px; flex-direction: column; gap: 2px; }
 }
-@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 </style>

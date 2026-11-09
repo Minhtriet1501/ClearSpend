@@ -33,10 +33,13 @@ public class TransactionController {
         return repo.findAll(pageable);
     }
 
-    /** Distinct agency names, for the filter dropdown. */
+    /** Distinct agency names, optionally within one government (source), for the filter dropdown. */
     @GetMapping("/agencies")
-    public List<String> agencies() {
-        return mongo.findDistinct(new Query(), "agency", "transactions", String.class)
+    public List<String> agencies(@RequestParam(required = false) String source) {
+        Query q = new Query();
+        if (source != null && !source.isBlank())
+            q.addCriteria(Criteria.where("source").is(source));
+        return mongo.findDistinct(q, "agency", "transactions", String.class)
                 .stream().filter(a -> a != null && !a.isBlank()).sorted().toList();
     }
 
